@@ -1,0 +1,246 @@
+#!/bin/bash
+
+
+RANDOMNESS=$(openssl rand -base64 29 | tr -d "=+/" | cut -c1-8)
+
+function cleanup() {
+  pushd minikube
+  minikube stop
+  minikube delete
+  rm -rf .minikube 
+
+
+  popd
+
+
+  # Purge the TF State
+  rm -rf ./terraform/.terraform
+  rm -rf ./terraform/.terraform.lock.hcl
+  exit 0
+}
+
+trap cleanup SIGKILL SIGINT
+
+function init_minikube() {
+  pushd minikube
+  #Open Docker, only if is not running
+    if (! docker stats --no-stream ); then
+    # On Mac OS this would be the terminal command to launch Docker
+    open /Applications/Docker.app
+    #Wait until Docker daemon is running and has completed initialisation
+    while (! docker stats --no-stream ); do
+    # Docker takes a few seconds to initialize
+    echo "Waiting for Docker to launch..."
+    sleep 1
+    done
+    fi
+  minikube start
+  popd
+}
+
+# https://www.digitalocean.com/community/tutorials/how-to-access-vault-secrets-inside-of-kubernetes-using-external-secrets-operator-eso
+function init_eso() {
+  pushd eso
+  helm repo add external-secrets https://charts.external-secrets.io
+  helm repo update
+  helm install --debug external-secrets \
+    external-secrets/external-secrets \
+      -n external-secrets \
+      --create-namespace \
+    # --set installCRDs=true
+  kubectl get pods --all-namespaces
+
+
+  echo "Giving external-serets a moment to stabilize post helm install..."
+  sleep 20
+
+  kubectl create secret generic vault-token --from-literal=token=$RANDOMNESS
+  kubectl get secrets
+MINIKUBE_IP=$(minikube ip)
+# https://external-secrets.io/v0.5.9/provider-hashicorp-vault/
+  cat > helm-eso-secret-store.yml <<EOF
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: vault-backend
+  namespace: default
+spec:
+  provider:
+    vault:
+      server: "http://127.0.0.1:8200"
+      path: "secret"
+      version: "v2"
+      auth:
+        # points to a secret that contains a vault token
+        # https://www.vaultproject.io/docs/auth/token
+        tokenSecretRef:
+          name: "vault-token"
+          key: "token"
+EOF
+
+kubectl apply -f helm-eso-secret-store.yml
+# kubectl get SecretStore vault-backend -o yaml
+
+
+  cat > eso-external-secret.yml <<EOF
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: vault-example
+  namespace: default
+spec:
+  refreshInterval: "15s"
+  secretStoreRef:
+    name: vault-backend
+    kind: SecretStore
+  target:
+    name: example-sync
+  data:
+  - secretKey: foobar
+    remoteRef:
+      key: secret/foo
+      property: my-value
+EOF
+
+  kubectl apply -f eso-external-secret.yml
+  # kubectl get ExternalSecret secret/foo -o yaml
+  popd
+}
+
+function init_vault() {
+  pushd vault
+  helm repo add hashicorp https://helm.releases.hashicorp.com
+  helm repo update
+  cat > helm-vault-raft-values.yml <<EOF
+server:
+  affinity: ""
+  ha:
+    enabled: true
+    raft: 
+      enabled: true
+EOF
+
+
+  cat > minikube-persistent-volume.yml <<YAML
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minkube
+spec:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 20Gi
+  hostPath:
+    path: /tmp/minikube-$RANDOMNESS/
+
+YAML
+
+  kubectl apply -f minikube-persistent-volume.yml
+
+  helm install --debug vault hashicorp/vault --debug --values helm-vault-raft-values.yml --wait
+
+  # echo "Giving pods a moment to be ready post helm deployment"
+  # sleep 20
+
+  echo "Initializing Vault"
+  kubectl exec vault-0 -- vault operator init -key-shares=1 -key-threshold=1 > init-$RANDOMNESS.txt
+
+  echo "Sourcing Vault"
+  export VAULT_ROOT_TOKEN=$(cat init-$RANDOMNESS.txt | grep '^Initial' | awk '{print $4}')
+  export VAULT_UNSEAL_KEY=$(cat init-$RANDOMNESS.txt | grep '^Unseal Key 1' | awk '{print $4}')
+  export VAULT_TOKEN=$VAULT_ROOT_TOKEN
+  export VAULT_ADDR="http://127.0.0.1:8200"
+  export VAULT_SKIP_VERIFY=true
+
+  kubectl exec vault-0 -- vault operator unseal $VAULT_UNSEAL_KEY
+
+  echo "Giving Vault a moment to do operator unseal post init on vault-0"
+  sleep 10
+
+  kubectl exec -ti vault-1 -- vault operator raft join http://vault-0.vault-internal:8200
+
+  kubectl exec -ti vault-2 -- vault operator raft join http://vault-0.vault-internal:8200
+
+  kubectl exec -ti vault-1 -- vault operator unseal $VAULT_UNSEAL_KEY
+
+  kubectl exec -ti vault-2 -- vault operator unseal $VAULT_UNSEAL_KEY
+
+  kubectl port-forward \
+      $(kubectl get pod -o jsonpath="{.items[0].metadata.name}") \
+      8200:8200 &
+
+  vault login $VAULT_ROOT_TOKEN 
+
+  # vault secrets enable -version=1 kv
+  vault secrets enable -version=2 kv
+
+  vault policy write demo-policy -<<EOF     
+path "secret/*"                                                  
+{  
+  capabilities = ["create", "read", "update"]                
+}                         
+path "kv/*"                                                  
+{  
+  capabilities = ["create", "read", "update"]                
+}                         
+EOF
+
+vault kv put kv/foo my-value=s3cr3t
+
+# k8s_host="$(kubectl exec vault-0 -- printenv | grep KUBERNETES_PORT_443_TCP_ADDR | cut -f 2- -d "=" | tr -d " ")"
+# k8s_port="443"            
+# k8s_cacert="$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[].cluster.certificate-authority-data}' | base64 --decode)"
+# secret_name="$(kubectl get serviceaccount vault -o go-template='')"
+# tr_account_token="$(kubectl get secret ${secret_name} -o go-template='' | base64 --decode)"
+
+
+
+# vault write auth/kubernetes/config token_reviewer_jwt="${tr_account_token}" kubernetes_host="https://${k8s_host}:${k8s_port}" kubernetes_ca_cert="${k8s_cacert}" 
+# disable_issuer_verification=true
+
+
+
+  popd
+}
+
+function init_terraform() {
+  pushd terraform
+  terraform init
+  terraform apply -auto-approve
+  popd
+}
+
+function strip() {
+  echo "$1" | tr -d '"'
+}
+
+for arg in "$@"
+do
+    case $arg in
+        all)
+        init_minikube
+        init_vault
+        init_eso
+        # init_compose
+        # init_terraform
+        shift
+        ;;
+        eso)
+        init_eso
+        shift
+        ;;
+        vault)
+        init_vault
+        shift
+        ;;
+        cleanup)
+        cleanup
+        shift
+        ;;
+        *)
+        echo "cmd not found: try 'all', 'login', or 'cleanup'"
+        shift
+        ;;
+    esac
+done
